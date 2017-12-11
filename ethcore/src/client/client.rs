@@ -164,6 +164,9 @@ struct Importer {
 
 	/// Ethereum engine to be used during import
 	pub engine: Arc<EthEngine>,
+
+	// WARNING: circle reference may lead to a resource leak
+	client: Arc<Client>,
 }
 
 /// Blockchain database client backed by a persistent database. Owns and manages a blockchain and a block queue.
@@ -227,12 +230,17 @@ pub struct Client {
 	importer: Importer,
 }
 
+impl Nonce for Importer {
+
+}
+
 impl Importer {
 	pub fn new(
 		config: &ClientConfig,
 		engine: Arc<EthEngine>,
 		message_channel: IoChannel<ClientIoMessage>,
 		miner: Arc<Miner>,
+		client: Arc<Client>,
 	) -> Result<Importer, ::error::Error> {
 		let block_queue = BlockQueue::new(config.queue.clone(), engine.clone(), message_channel.clone(), config.verifier_type.verifying_seal());
 
@@ -306,6 +314,161 @@ impl Importer {
 		db.flush().expect("DB flush failed.");
 		Ok(hash)
 	}
+
+	/// This is triggered by a message coming from a block queue when the block is ready for insertion
+	pub fn import_verified_blocks(&self, client: &Client) -> usize {
+
+		// // Shortcut out if we know we're incapable of syncing the chain.
+		// if !self.enabled.load(AtomicOrdering::Relaxed) {
+		// 	return 0;
+		// }
+
+		let max_blocks_to_import = 4;
+		let (imported_blocks, import_results, invalid_blocks, imported, proposed_blocks, duration, is_empty) = {
+			let mut imported_blocks = Vec::with_capacity(max_blocks_to_import);
+			let mut invalid_blocks = HashSet::new();
+			let mut proposed_blocks = Vec::with_capacity(max_blocks_to_import);
+			let mut import_results = Vec::with_capacity(max_blocks_to_import);
+
+			let _import_lock = self.import_lock.lock();
+			let blocks = self.block_queue.drain(max_blocks_to_import);
+			if blocks.is_empty() {
+				return 0;
+			}
+			let _timer = PerfTimer::new("import_verified_blocks");
+			let start = precise_time_ns();
+
+			for block in blocks {
+				let header = &block.header;
+				let is_invalid = invalid_blocks.contains(header.parent_hash());
+				if is_invalid {
+					invalid_blocks.insert(header.hash());
+					continue;
+				}
+				if let Ok(closed_block) = client.check_and_close_block(&block) {
+					if self.engine.is_proposal(&block.header) {
+						self.block_queue.mark_as_good(&[header.hash()]);
+						proposed_blocks.push(block.bytes);
+					} else {
+						imported_blocks.push(header.hash());
+
+						let route = client.commit_block(closed_block, &header, &block.bytes);
+						import_results.push(route);
+
+						client.report.write().accrue_block(&block);
+					}
+				} else {
+					invalid_blocks.insert(header.hash());
+				}
+			}
+
+			let imported = imported_blocks.len();
+			let invalid_blocks = invalid_blocks.into_iter().collect::<Vec<H256>>();
+
+			if !invalid_blocks.is_empty() {
+				self.block_queue.mark_as_bad(&invalid_blocks);
+			}
+			let is_empty = self.block_queue.mark_as_good(&imported_blocks);
+			let duration_ns = precise_time_ns() - start;
+			(imported_blocks, import_results, invalid_blocks, imported, proposed_blocks, duration_ns, is_empty)
+		};
+
+		{
+			if !imported_blocks.is_empty() && is_empty {
+				let (enacted, retracted) = self.calculate_enacted_retracted(&import_results);
+
+				if is_empty {
+					self.miner.chain_new_blocks(self, &imported_blocks, &invalid_blocks, &enacted, &retracted);
+				}
+
+				client.notify(|notify| {
+					notify.new_blocks(
+						imported_blocks.clone(),
+						invalid_blocks.clone(),
+						enacted.clone(),
+						retracted.clone(),
+						Vec::new(),
+						proposed_blocks.clone(),
+						duration,
+					);
+				});
+			}
+		}
+
+		client.db.read().flush().expect("DB flush failed.");
+		imported
+	}
+
+	/*fn check_and_close_block(&self, block: &PreverifiedBlock) -> Result<LockedBlock, ()> {
+		let engine = &*self.engine;
+		let header = &block.header;
+
+		let chain = self.chain.read();
+		// Check the block isn't so old we won't be able to enact it.
+		let best_block_number = chain.best_block_number();
+		if self.pruning_info().earliest_state > header.number() {
+			warn!(target: "client", "Block import failed for #{} ({})\nBlock is ancient (current best block: #{}).", header.number(), header.hash(), best_block_number);
+			return Err(());
+		}
+
+		// Check if parent is in chain
+		let parent = match chain.block_header(header.parent_hash()) {
+			Some(h) => h,
+			None => {
+				warn!(target: "client", "Block import failed for #{} ({}): Parent not found ({}) ", header.number(), header.hash(), header.parent_hash());
+				return Err(());
+			}
+		};
+
+		// Verify Block Family
+		let verify_family_result = self.verifier.verify_block_family(
+			header,
+			&parent,
+			engine,
+			Some((&block.bytes, &block.transactions, &**chain, self)),
+		);
+
+		if let Err(e) = verify_family_result {
+			warn!(target: "client", "Stage 3 block verification failed for #{} ({})\nError: {:?}", header.number(), header.hash(), e);
+			return Err(());
+		};
+
+		let verify_external_result = self.verifier.verify_block_external(header, engine);
+		if let Err(e) = verify_external_result {
+			warn!(target: "client", "Stage 4 block verification failed for #{} ({})\nError: {:?}", header.number(), header.hash(), e);
+			return Err(());
+		};
+
+		// Enact Verified Block
+		let last_hashes = self.build_last_hashes(header.parent_hash().clone());
+		let db = self.state_db.lock().boxed_clone_canon(header.parent_hash());
+
+		let is_epoch_begin = chain.epoch_transition(parent.number(), *header.parent_hash()).is_some();
+		let enact_result = enact_verified(block,
+			engine,
+			self.tracedb.read().tracing_enabled(),
+			db,
+			&parent,
+			last_hashes,
+			self.factories.clone(),
+			is_epoch_begin,
+		);
+		let mut locked_block = enact_result.map_err(|e| {
+			warn!(target: "client", "Block import failed for #{} ({})\nError: {:?}", header.number(), header.hash(), e);
+		})?;
+
+		if header.number() < self.engine().params().validate_receipts_transition && header.receipts_root() != locked_block.block().header().receipts_root() {
+			locked_block = locked_block.strip_receipts();
+		}
+
+		// Final Verification
+		if let Err(e) = self.verifier.verify_block_final(header, locked_block.block().header()) {
+			warn!(target: "client", "Stage 5 block verification failed for #{} ({})\nError: {:?}", header.number(), header.hash(), e);
+			return Err(());
+		}
+
+		Ok(locked_block)
+	}*/
 
 	fn calculate_enacted_retracted(&self, import_results: &[ImportRoute]) -> (Vec<H256>, Vec<H256>) {
 		fn map_to_vec(map: Vec<(H256, bool)>) -> Vec<H256> {
